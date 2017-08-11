@@ -1,0 +1,563 @@
+1.insert into是增加数据
+2.insert overwrite是删除原有数据然后在新增数据，如果有分区那么只会删除指定分区数据，其他分区数据不受影响
+
+
+3.load data inpath......这样的语句会将path中的数据移动到hive表中，而不是复制，是移动，所以load后，源文件就消失了！
+
+*json 中的key-value对可以顺序和hive表字段出现顺序不一致
+
+*load data inpath可以path可以是一个文件夹
+//创建外部表
+use cp_project;
+
+hive -e "alter table cp_project.cp_origin_external drop if exists partition (date='20170524');alter table cp_project.cp_origin_external add partition(date='20170524') location '/docker_messages/cplog/20170524'"
+
+//记住/usr/bin/hive -e "$HQL_PRE"这个$HQL_PRE一定要加双引号，不然会报错
+
+drop table if exists cp_origin_external;
+create external table cp_origin_external(
+line string) partitioned by(date string);
+
+
+
+
+alter table cp_origin_external add partition (date='20170523') location '/docker_messages/cplog/20170523';
+
+
+insert overwrite directory '/docker_messages/cplog_pre/20170524' select line from cp_origin_external where date='20170524' and instr(line,'ms:cp')>0;
+
+//---------------------
+//添加hive解析json的jar包
+add jar /var/lib/hadoop-hdfs/udf/json-serde-1.3.7-jar-with-dependencies.jar;
+//创建json格式的表格
+drop table if exists cp_origin_log;
+create table cp_origin_log(
+container_id string,
+container_name string,
+source string,
+log string
+) partitioned by(date string)
+ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
+STORED AS TEXTFILE;
+/此时不符合格式的json将会变为null null .....
+//但是这个设置下符合json格式但是不符合hive表的结构的数据会报错
+ ALTER TABLE cp_origin_log SET SERDEPROPERTIES ( "ignore.malformed.json" = "true");
+
+*从20170523中取得原始数据
+/var/lib/hadoop-hdfs/2017/20170523
+
+//load data local inpath '/var/lib/hadoop-hdfs/2017/20170523'overwrite into table cp_origin_log partition(date='20170523')
+
+
+
+
+drop table if exists cp_uuid_log;
+create table cp_uuid_log(
+container_id string,
+container_name string,
+source string,
+log string
+)
+partitioned by(date string)
+row format delimited fields terminated by '\0001' 
+
+insert overwrite table cp_uuid_log partition(date="20170523") select container_id,container_name,source,log from cp_origin_log where instr(log,'uuid') > 0;
+
+
+//以下用来将log变为字段
+add jar /var/lib/hadoop-hdfs/udf/cp-1.0-SNAPSHOT.jar
+
+public class LogToField extends UDF {
+
+    public String evaluate(String log,String field){
+        if(log!=null && log!="" && field!=null && field!="" &&log.contains("uuid")){
+           String[] fieldArr = log.split("\\|");
+           for(int i=0;i<fieldArr.length;i++){
+               if(!fieldArr[i].contains(field)) continue;
+               String[] tmpArr = fieldArr[i].split(":");
+               if (tmpArr.length==2 && tmpArr[0].equals(field)) return tmpArr[1];
+           }
+
+
+        }
+        return "nil";
+
+    }
+
+}
+//-----------------------------------------------------------------------------------
+{"source":"stdout","log":"2017-05-23 23:50:38.623 - ms:cp|type:session|uuid:8ee9d035-ec3d-4215-b292-a9bafb5dec0a|dateTime:2017-05-23 23:50:38|sid:fd0e3e16-8373-4a0e-aae6-2e3b1f5c1bfb|uid:201|aid:fc2718be5db24239a9d95cb5d79e6079|lid:13701469860|lty:0|did:|dty:0","container_id":"50809a3b68826d40f3daf7b8fa97ee3ff67c9f7d494dd71417ad856c4b18923d","container_name":"/mesos-20161022-062308-168821002-5050-1-S5.eca6fa58-24d6-4ba8-a946-c34c4da399a7"}
+
+drop table if exists t_cp_session;
+create table t_cp_session(
+type string,
+uuid string,
+dateTime string,
+sid string,
+uid string,
+aid string,
+lid string,
+lty string,
+did string,
+dty string
+) 
+partitioned by(date string)
+row format delimited fields terminated by '\0001' 
+
+
+create temporary function logToField as 'cn.com.pateo.cpETL.LogToField';
+
+
+//将数据含有uuid的 cp_uuid_log表中的数据插入t_cp_session中
+insert overwrite table t_cp_session partition(date='20170523')
+select logToField(log,'type') as type,
+logToField(log,'uuid') as uuid,
+logToField(log,'dateTime') as dateTime,
+logToField(log,'sid') as sid, 
+logToField(log,'uid') as uid,
+logToField(log,'aid') as aid,
+logToField(log,'lid') as lid,
+logToField(log,'lty') as lty,
+logToField(log,'did') as did,
+logToField(log,'dty') as dty
+from cp_uuid_log  where logToField(log,'type')='session';
+
+
+
+//-------------------------------------------------------------------------------------------------------
+"2017-05-23 23:34:45.967 - ms:cp|type:platform|uuid:a58f30be-c8ee-44e8-9435-935daff0e9e7|dateTime:2017-05-23 23:34:45|deviceTypeSid:28|deviceTypeCode:DT00000001|deviceTypeName:测试设备1|platContentTypeSid:113|platContentTypeCode:cp_radio|platContentTypeName:电台|platContentDetailApiSid:1093|detailApiCode:电台|detailApiName:电台|isSuccess:0",
+
+drop table if exists t_cp_platform;
+create table t_cp_platform(
+type string,
+uuid string,
+dateTime string,
+deviceTypeSid string,
+deviceTypeCode string,
+deviceTypeName string,
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+platContentDetailApiSid string,
+detailApiCode string,
+detailApiName string,
+isSuccess string
+)
+partitioned by(date string)
+row format delimited fields terminated by '\0001'; 
+
+
+insert overwrite table t_cp_platform partition(date='20170523')
+select logToField(log,'type') as type,
+logToField(log,'uuid') as uuid,
+logToField(log,'dateTime') as dateTime,
+logToField(log,'deviceTypeSid') as deviceTypeSid, 
+logToField(log,'deviceTypeCode') as deviceTypeCode,
+logToField(log,'deviceTypeName') as deviceTypeName,
+logToField(log,'platContentTypeSid') as platContentTypeSid,
+logToField(log,'platContentTypeCode') as platContentTypeCode,
+logToField(log,'platContentTypeName') as platContentTypeName,
+logToField(log,'platContentDetailApiSid') as platContentDetailApiSid,
+logToField(log,'detailApiCode') as detailApiCode,
+logToField(log,'detailApiName') as detailApiName,
+logToField(log,'isSuccess') as isSuccess
+from cp_uuid_log  where logToField(log,'type')='platform';
+
+
+
+//--------------------------------------------------------------------------------------
+
+
+//-------------------------------------------------------------------------------------------------------
+"log":"2017-05-23 23:34:45.967 - ms:cp|type:provider|uuid:a58f30be-c8ee-44e8-9435-935daff0e9e7|dateTime:2017-05-23 23:34:45|providerSid:81|providerCode:XiMaLaYa|providerName:喜马拉雅|providerContentApiAdapterSid:1412|providerContentApiAdapterCode:cp_radio_ondemand_albumsList_xmly|providerContentApiAdapterName:电台-点播接口-获取某个分类某个标签下的热门专辑列表/最新专辑列表/最多播放专辑列表-喜马拉雅|cpApiPath:http://api.ximalaya.com/oauth2/secure_access_token{sig=3006b4bbe65e85b7c3bf74224fa4c148, device_id=cb710f8f91a96feed10b47daadd3a2456a3c7d8a, grant_type=client_credentials, nonce=ftrstf12f3cxi3w63d2d01m, client_id=0b7f57ca7def18361e874765da597b08, timestamp=1495553685919}|isSuccess:0"}
+
+
+drop table if exists t_cp_provider;
+create table t_cp_provider(
+type string,
+uuid string,
+dateTime string,
+providerSid string,
+providerCode string,
+providerName string,
+providerContentApiAdapterSid string,
+providerContentApiAdapterCode string,
+providerContentApiAdapterName string,
+cpApiPath string,
+isSuccess string
+)
+partitioned by(date string)
+row format delimited fields terminated by '\0001';
+
+ 
+insert overwrite table t_cp_provider partition(date='20170523')
+select logToField(log,'type') as type,
+logToField(log,'uuid') as uuid,
+logToField(log,'dateTime') as dateTime,
+logToField(log,'providerSid') as providerSid, 
+logToField(log,'providerCode') as providerCode,
+logToField(log,'providerName') as providerName,
+logToField(log,'providerContentApiAdapterSid') as providerContentApiAdapterSid,
+logToField(log,'providerContentApiAdapterCode') as providerContentApiAdapterCode,
+logToField(log,'providerContentApiAdapterName') as providerContentApiAdapterName,
+logToField(log,'cpApiPath') as cpApiPath,
+logToField(log,'isSuccess') as isSuccess
+from cp_uuid_log  where logToField(log,'type')='provider';
+//--------------------------------------------------------------------------------------
+
+select uid,uuid,dateTime,row_number() over(partition by uid order by dateTime) orders from t_cp_session;
+
+    select s.uid,s.uuid,p.platContentTypeSid ,row_number() over(partition by s.uid,s.uuid order by p.platContentTypeSid) orders from t_cp_session s inner join t_cp_platform p on s.uuid = p.uuid  limit 100;
+
+select uuid,dateTime,row_number() over(partition by uuid order by dateTime) orders from t_cp_platform;
+
+
+
+//对数据进行分析
+
+select count(*) from t_cp_session;->439 ->701
+select count(distinct(uuid)) from t_cp_session;->439->701;
+//cp-session不一定存在，只有用户经过了登录鉴权才会存在
+select count(*)  from t_cp_session s inner join t_cp_platform p on s.uuid = p.uuid ;->439
+
+
+select count(*) from t_cp_platform;->15876  ->50184
+select count(distinct(uuid)) from t_cp_platform;->15876;->50184//也就是每次的点击都是一次不同的uuid，有多少次点击调用就有多少uuid
+
+
+
+select count(*) from t_cp_provider;->14205
+
+
+
+
+用户登录调用cp接口 session（uuid）-> platform(uuid) -> provider(uuid)全程uuid相同
+用户不登录调用cp接口 platform（uuid）-> provider(uuid)  //这部分数据可以忽略，因为生产过程中不登录的调用非常的少
+
+
+
+select  s.uid,s.aid,s.lid,s.lty,s.did,s.dty,p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName from t_cp_session s inner join t_cp_platform p on s.uuid = p.uuid limit 100; 
+
+
+select s.uid,s.dateTime,p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName,row_number() over(partition by s.uid order by s.dateTime) from t_cp_session s inner join t_cp_platform p on s.uuid = p.uuid limit 100;
+
+
+select s.uid,s.dateTime,s
+
+//以下统计一下每天每个cp的uuid和uid；
+
+select count(*) from t_cp_platform where date='20170524' ->34308;
+
+select count(*) from t_cp_platform p left outer join t_cp_session s on (p.uuid=s.uuid and p.date='20170524' and s.date='20170524')   ->34308
+
+select count(distinct(uid)) from t_cp_session;->4
+select count(distinct(uuid)) from t_cp_session;->262
+
+
+insert overwrite table i_cp_uuid_total partition(date='20170524') 
+select p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName,count(distinct(p.uuid)),count(distinct(s.uuid)),count(distinct(s.uid)) from t_cp_platform p left outer join t_cp_session s on (p.uuid=s.uuid and p.date='20170524' and s.date='20170524') group by p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName;
+
+
+drop table if exists i_cp_uuid_total;
+create table i_cp_uuid_total(
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+platform_uuid string,
+session_uuid string,
+session_uid string)
+partitioned by(date string)
+row format delimited fields terminated by '\0001';
+ 
+109     cp_weather      天气    144     142     4       20170524
+113     cp_radio        电台    34164   120     1       20170524
+
+insert overwrite table i_cp_uid_total partition(date='20170524')
+select p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName,s.uid,count(distinct(p.uuid)),count(distinct(s.uuid)) from t_cp_platform p left outer join t_cp_session s on (p.uuid=s.uuid and p.date='20170524' and s.date='20170524') group by p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName,s.uid;
+
+drop table if exists i_cp_uid_total;
+create table i_cp_uid_total(
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+session_uid string,
+platform_uuid string,
+session_uuid string)
+partitioned by(date string)
+row format delimited fields terminated by '\0001';
+109     cp_weather      天气    NULL    2       0       20170524
+109     cp_weather      天气    120     41      41      20170524
+109     cp_weather      天气    201     69      69      20170524
+109     cp_weather      天气    205     31      31      20170524
+109     cp_weather      天气    214     1       1       20170524
+113     cp_radio        电台    NULL    34044   0       20170524
+113     cp_radio        电台    120     120     120     20170524
+
+
+
+//将hive中的数据导出到excel表中
+
+hive -e "select * from cp_project.i_cp_uuid_total" >> uuid.csv;
+
+hive -e "select * from cp_project.i_cp_uid_total" >> uid.csv;
+
+
+select p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName,count(distinct(p.uuid))
+group by p.platContentTypeSid,p.platContentTypeCode,p.platContentTypeName from t_cp_platform p where date='20170531'
+select count(distinct(uuid) u_total,'20170531' as u_date from t_cp_platform where date='20170531';
+
+
+select count(*) from t_cp_platform where date='20170524' -->34308
+select count(*) from (select * from t_cp_platform where date='20170524') a left outer join 
+(select * from t_cp_session where date='20170524') b on a.uuid=b.uuid -->34308;
+
+drop table if exists i_cp_req_total;
+create table i_cp_req_total(
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+cp_total int,
+cur_total int,
+cp_percent float,
+cp_date string)
+partitioned by(date string)
+row format delimited fields terminated by '\0001';
+//计算当日每个cp的uuid个数，以及每个cp的uuid占当日uuid的百分比
+
+insert overwrite table i_cp_req_total partition(date='20170523')
+select a.platContentTypeSid,a.platContentTypeCode,a.platContentTypeName,a.cp_total,b.total,round(cast(a.cp_total as float)/cast(b.total as float),6),'20170523' as cp_date from
+(select platContentTypeSid,platContentTypeCode,platContentTypeName,count(distinct(uuid)) as cp_total from t_cp_platform where date='20170523' group by platContentTypeSid,platContentTypeCode,platContentTypeName) a join 
+(select count(distinct(uuid)) as total from t_cp_platform where date='20170523') b;
+
+//计算当日每个cp的成功的请求率
+drop table if exists i_cp_hour_rate;
+create table i_cp_hour_rate(
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+hr string,
+succ_cnt int,
+succ_rate float,
+fail_cnt int,
+fail_rate float,
+total int,
+cp_date string)
+partitioned by(date string)
+row format delimited fields terminated by '\0001';
+
+insert overwrite table i_cp_hour_rate partition(date='20170607')
+select platContentTypeSid,platContentTypeCode,platContentTypeName,hr,succ,round(succ/total,6),fail,round(fail/total,6),total,'20170607' as cp_date
+from(
+select  platContentTypeSid,platContentTypeCode,platContentTypeName,concat(year,'-',month,'-',day,'-',hour) as hr,
+sum(case cast(issuccess as int) when 0 then 1 else 0 end) as succ,
+sum(case cast(issuccess as int) when 1 then 1 else 0 end) as fail,
+count(*) as total from (
+select platContentTypeSid,platContentTypeCode,platContentTypeName,dateTime,
+substr(dateTime,1,4) as year,
+substr(dateTime,6,2) as month,
+substr(dateTime,9,2) as day,
+substr(dateTime,12,2) as hour,
+substr(dateTime,15,2) as minute,
+substr(dateTime,18,2) as secound,
+issuccess
+from t_cp_platform where dateTime is not null and date='20170607') tmp group by platContentTypeSid,platContentTypeCode,platContentTypeName,concat(year,'-',month,'-',day,'-',hour)
+) tmp;
+ 
+sqoop export --connect  jdbc:mysql://10.1.16.60:3306/CPlog  --username obd_message --password obd_message --table  i_cp_req_total --hcatalog-database cp_project --hcatalog-table i_cp_req_total
+sqoop export --connect  jdbc:mysql://10.1.16.60:3306/CPlog --username obd_message --password obd_message --table  i_cp_req_total --columns "platContentTypeSid,platContentTypeCode,platContentTypeName,cp_total,cur_total,cp_percent,date" --hcatalog-database cp_project --hcatalog-table i_cp_req_total --hcatalog-partition-keys date --hcatalog-partition-values "20170604"
+
+
+select * from t_cp_platform where date='20170611' and  instr(line,'2017-06-10')>0
+
+
+//要考虑去除掉当日文件夹中dateTime字段非当日的数据
+
+
+select count(*) from (select * from t_cp_platform where date='20170708') a left outer join 
+(select * from t_cp_session where date='20170708') b on a.uuid=b.uuid;
+
+select count(*) from t_cp_platform where date='20170708'
+select count(distinct(c.uuid)) from (select * from t_cp_platform where date='20170708') c left outer join 
+(select * from t_cp_provider where date='20170708') d on c.uuid=d.uuid;
+
+
+select count(*) from (select * from t_cp_platform where date='20170708') c  join 
+(select * from t_cp_provider where date='20170708') d on c.uuid=d.uuid;
+
+t_cp_session这张表的每一行uuid都是不同；
+t_cp_platform这张表每一行uuid都是不同
+t_cp_provider这张表uuid有相等的
+provider        bb3d6306-c158-414a-bdb0-b26525486c54    2017-07-08 08:00:30.640 81      XiMaLaYa        喜马拉雅        1413    cp_radio_ondemand_albumsBrowse_xmly        电台-点播接口-根据专辑ID获取专辑下的声音列表-喜马拉雅   http://api.ximalaya.com/oauth2/secure_access_token{sig=ea65e4c69e4c5f2ec5f77c57e7936c72, device_id=9ba1edf1c137f41621c9f04bbb30da6b85b3e48c, grant_type=client_credentials, nonce=ixk3mocefhrg10zuzja8gp, client_id=0b7f57ca7def18361e874765da597b08, timestamp=1499472029384}        0       20170708
+provider        bb3d6306-c158-414a-bdb0-b26525486c54    2017-07-08 08:00:30.640 81      XiMaLaYa        喜马拉雅        1413    cp_radio_ondemand_albumsBrowse_xmly        电台-点播接口-根据专辑ID获取专辑下的声音列表-喜马拉雅   http://api.ximalaya.com/albums/browse?&access_token=f69b7456e80925aad4591736fec73352&sig=0b9c8769a1304ab4b7959aa3cc94c9b1&app_key=0b7f57ca7def18361e874765da597b08&client_os_type=2&device_id=9ba1edf1c137f41621c9f04bbb30da6b85b3e48c&pack_id=com.ximalaya.ting.android.botaichezai&count=10&album_id=4308484&sort=asc&page=1        0       20170708
+
+
+//以下方法无法去重
+select count(t1.uuid)  from (select distinct uuid from t_cp_provider where date='20170708')  t1 join 
+(select uuid from t_cp_provider where date='20170708') t2  on t1.uuid=t2.uuid;
+
+//row_number over(partition by a order by b) //可以去重
+select count(*) from (
+select uuid,datetime,row_number() over(partition by uuid order by datetime) as num from t_cp_provider where date='20170708') t
+where t.num = 1 ;-->2302
+
+select count(distinct(uuid)) from t_cp_provider where date='20170708';--->2302
+
+//拿到t_cp_provider 表中所有的数据遇到uuid重复的随便取一条
+
+
+得到最终的一张宽表
+select count(*) from 
+(
+select 
+a.uuid as platformUuid,
+a.deviceTypeSid,
+a.deviceTypeCode,
+a.deviceTypeName,
+a.platContentTypeSid,
+a.platContentTypeCode,
+a.platContentTypeName,
+a.platContentDetailApiSid,
+a.detailApiCode,
+a.detailApiName,
+a.isSuccess as platformIsSuccess,
+b.uuid as sessionUuid,
+b.dateTime as sessionDateTime ,
+b.sid,
+b.uid,
+b.aid,
+b.lid,
+b.lty,
+b.did,
+b.dty from (select * from t_cp_platform where date='20170708') a left outer join 
+(select * from t_cp_session where date='20170708') b on a.uuid=b.uuid
+) ps
+left outer join 
+(
+select 
+uuid as providerUuid,
+dateTime as providerDateTime,
+providerSid,
+providerCode,
+providerName,
+providerContentApiAdapterSid,
+providerContentApiAdapterCode,
+providerContentApiAdapterName,
+cpApiPath,
+isSuccess as providerIsSuccess from (
+select *,row_number() over(partition by uuid order by datetime) as num from t_cp_provider where date='20170708') t
+where t.num = 1
+) p
+
+on ps.platformUuid = p.providerUuid  where ps.sessionUuid is not null;
+
+drop table if exists t_cp_all;
+create table t_cp_all(
+platformUuid string,
+deviceTypeSid string,
+deviceTypeCode string,
+deviceTypeName string,
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+platContentDetailApiSid string,
+detailApiCode string,
+detailApiName string,
+platformIsSuccess string,
+sessionUuid string,
+sessionDateTime string,
+sid string,
+uid string,
+aid string,
+lid string,
+lty string,
+did string,
+dty string,
+providerUuid string,
+providerDateTime string,
+providerSid string,
+providerCode string,
+providerName string,
+providerContentApiAdapterSid string,
+providerContentApiAdapterCode string,
+providerContentApiAdapterName string,
+cpApiPath string,
+providerIsSuccess string
+) partitioned by(date string)
+row format delimited fields terminated by '\0001';
+
+
+insert overwrite table t_cp_all partition(date='20170708')
+select * from 
+(
+select 
+a.uuid as platformUuid,
+a.deviceTypeSid,
+a.deviceTypeCode,
+a.deviceTypeName,
+a.platContentTypeSid,
+a.platContentTypeCode,
+a.platContentTypeName,
+a.platContentDetailApiSid,
+a.detailApiCode,
+a.detailApiName,
+a.isSuccess as platformIsSuccess,
+b.uuid as sessionUuid,
+b.dateTime as sessionDateTime ,
+b.sid,
+b.uid,
+b.aid,
+b.lid,
+b.lty,
+b.did,
+b.dty from (select * from t_cp_platform where date='20170708') a left outer join 
+(select * from t_cp_session where date='20170708') b on a.uuid=b.uuid
+) ps
+left outer join 
+(
+select 
+uuid as providerUuid,
+dateTime as providerDateTime,
+providerSid,
+providerCode,
+providerName,
+providerContentApiAdapterSid,
+providerContentApiAdapterCode,
+providerContentApiAdapterName,
+cpApiPath,
+isSuccess as providerIsSuccess from (
+select *,row_number() over(partition by uuid order by datetime) as num from t_cp_provider where date='20170708') t
+where t.num = 1
+) p
+on ps.platformUuid = p.providerUuid;
+
+
+
+select a.platContentTypeSid,a.platContentTypeCode,a.platContentTypeName,a.cp_total,b.total,round(cast(a.cp_total as float)/cast(b.total as float),6),concat
+('$rsyear','-','$smonth','-','$sday') as cp_date from
+
+
+insert overwrite table i_cp_req_cnt partition(date='20170708')
+select platContentTypeSid,platContentTypeCode,platContentTypeName,providerSid,providerCode,providerName,count(distinct(platformuuid)) as cp_total,concat('$rsyear','-','$smonth','-','$sday') as cp_date from t_cp_all
+where date='20170708' //不能有这句因为为null作为未知供应商and provideruuid is not null 
+group by platContentTypeSid,platContentTypeCode,platContentTypeName,providerSid,providerCode,providerName;
+
+create table i_cp_req_cnt
+(
+platContentTypeSid string,
+platContentTypeCode string,
+platContentTypeName string,
+providerSid string,
+providerCode string,
+providerName string,
+cp_total int,
+cp_date string
+)partitioned by(date string)
+row format delimited fields terminated by '\0001';
+
+ and instr(dateTime,concat('$rsyear','-','$smonth','-','$sday')) > 0
+) 
+
+
+
+a join 
+(select count(distinct(uuid)) as total from $t_cp_platform where date='$day_01' and instr(dateTime,concat('$rsyear','-','$smonth','-','$sday')) > 0) b;
